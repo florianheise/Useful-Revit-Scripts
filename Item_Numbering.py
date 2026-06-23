@@ -6,7 +6,7 @@ doc = __revit__.ActiveUIDocument.Document
 uidoc = __revit__.ActiveUIDocument
 
 # -----------------------------------
-# GET POINT (robust)
+# GET POINT
 # -----------------------------------
 def get_point(el):
     loc = el.Location
@@ -20,130 +20,156 @@ def get_point(el):
     return None
 
 # -----------------------------------
+# HELPERS
+# -----------------------------------
+def avg_point(group):
+    total = XYZ(0, 0, 0)
+    for d in group:
+        total += d["pt"]
+    return total / len(group)
+
+def dist_xy(a, b):
+    return math.hypot(a.X - b.X, a.Y - b.Y)
+
+# -----------------------------------
 # LOAD DATA
 # -----------------------------------
 elements = [doc.GetElement(i) for i in uidoc.Selection.GetElementIds()]
 
 data = []
-
 for el in elements:
     pt = get_point(el)
     if pt:
-        data.append({
-            "el": el,
-            "pt": pt,
-            "visited": False
-        })
+        data.append({"el": el, "pt": pt})
 
 if not data:
     raise Exception("No usable elements selected.")
 
 # -----------------------------------
-# HELPERS
+# SETTINGS
 # -----------------------------------
-def dist_xy(a, b):
-    return math.hypot(a.X - b.X, a.Y - b.Y)
-
-def same_xy(a, b):
-    return dist_xy(a, b)
+GRID_COL = 0.1
+GRID_DEPTH = 0.3
 
 # -----------------------------------
-# STEP 1: START AT LOWEST
+# STEP 1: DETERMINE ORIENTATION
 # -----------------------------------
-current = min(data, key=lambda x: x["pt"].Z)
-current["visited"] = True
+xs = [d["pt"].X for d in data]
+ys = [d["pt"].Y for d in data]
 
-ordered = [current]
+range_x = max(xs) - min(xs)
+range_y = max(ys) - min(ys)
 
-# -----------------------------------
-# MAIN LOOP
-# -----------------------------------
-while len(ordered) < len(data):
-
-    current_pt = current["pt"]
-
-    # STEP 2: FIND NEXT ABOVE
-    candidates = [
-        d for d in data
-        if not d["visited"] and d["pt"].Z > current_pt.Z
-    ]
-
-    next_item = None
-
-    if candidates:
-        next_item = min(
-            candidates,
-            key=lambda d: dist_xy(current_pt, d["pt"])
-        )
-
-        sideways_check = [
-            d for d in data if not d["visited"]
-        ]
-
-        closest_any = min(
-            sideways_check,
-            key=lambda d: dist_xy(current_pt, d["pt"])
-        )
-
-        if dist_xy(current_pt, next_item["pt"]) > dist_xy(current_pt, closest_any["pt"]):
-            next_item = None
-
-    # STEP 3: SIDEWAYS
-    if next_item is None:
-        remaining = [d for d in data if not d["visited"]]
-
-        closest = min(
-            remaining,
-            key=lambda d: dist_xy(current_pt, d["pt"])
-        )
-
-        column_candidates = [
-            d for d in remaining
-        ]
-
-        column_candidates = [
-            d for d in column_candidates
-            if abs(dist_xy(d["pt"], closest["pt"])) < 1e-6
-        ]
-
-        if not column_candidates:
-            column_candidates = [closest]
-
-        next_item = min(column_candidates, key=lambda d: d["pt"].Z)
-
-    # UPDATE
-    next_item["visited"] = True
-    ordered.append(next_item)
-    current = next_item
+use_x_for_columns = range_x > range_y
 
 # -----------------------------------
-# WRITE MARKS + COMMENTS
+# STEP 2: NORMALISE ORIGIN
 # -----------------------------------
-t = Transaction(doc, "Final Stable Numbering")
+min_x = min(xs)
+min_y = min(ys)
+
+# -----------------------------------
+# STEP 3: ASSIGN COLUMN + PLANE
+# -----------------------------------
+for d in data:
+    pt = d["pt"]
+
+    if use_x_for_columns:
+        d["col"] = int(round((pt.X - min_x) / GRID_COL))
+        d["plane"] = int(round((pt.Y - min_y) / GRID_DEPTH))
+    else:
+        d["col"] = int(round((pt.Y - min_y) / GRID_COL))
+        d["plane"] = int(round((pt.X - min_x) / GRID_DEPTH))
+
+# -----------------------------------
+# STEP 4: GROUP COLUMNS
+# -----------------------------------
+columns = {}
+for d in data:
+    columns.setdefault(d["col"], []).append(d)
+
+col_keys = list(columns.keys())
+
+# -----------------------------------
+# STEP 5: FIND START COLUMN (BOTTOM LEFT)
+# -----------------------------------
+def column_score(col):
+    pts = columns[col]
+    min_z = min(d["pt"].Z for d in pts)
+    avg = avg_point(pts)
+    return (min_z, avg.X + avg.Y)
+
+start_col = min(col_keys, key=column_score)
+
+# -----------------------------------
+# STEP 6: ADJACENT COLUMN WALK
+# -----------------------------------
+ordered_cols = [start_col]
+remaining = set(col_keys)
+remaining.remove(start_col)
+
+current = start_col
+
+while remaining:
+    current_center = avg_point(columns[current])
+
+    next_col = min(
+        remaining,
+        key=lambda c: dist_xy(current_center, avg_point(columns[c]))
+    )
+
+    ordered_cols.append(next_col)
+    remaining.remove(next_col)
+    current = next_col
+
+# -----------------------------------
+# STEP 7: PROCESS EACH COLUMN
+# plane → height
+# -----------------------------------
+ordered = []
+
+for col in ordered_cols:
+    items = columns[col]
+
+    # group planes
+    planes = {}
+    for d in items:
+        planes.setdefault(d["plane"], []).append(d)
+
+    # sort planes
+    for p in sorted(planes.keys()):
+        plane_items = planes[p]
+
+        # ✅ always bottom → top
+        plane_sorted = sorted(plane_items, key=lambda d: d["pt"].Z)
+
+        ordered.extend(plane_sorted)
+
+# -----------------------------------
+# WRITE RESULTS
+# -----------------------------------
+t = Transaction(doc, "Final Adjacency Locked Numbering")
 t.Start()
 
 i = 1
 for item in ordered:
     el = item["el"]
 
-    # --- MARK PARAMETER ---
     p = el.LookupParameter("Mark")
     if p and not p.IsReadOnly:
         p.Set(str(i))
 
-    # --- NEW: MODEL IN-PLACE CHECK ---
     try:
         if isinstance(el, FamilyInstance):
             if el.Symbol and el.Symbol.Family.IsInPlace:
-
-                comment_param = el.LookupParameter("Comments")
-                if comment_param and not comment_param.IsReadOnly:
-                    comment_param.Set("Cut as per site")
+                c = el.LookupParameter("Comments")
+                if c and not c.IsReadOnly:
+                    c.Set("Cut as per site")
     except:
-        pass  # safe fallback if element type doesn't support this
+        pass
 
     i += 1
 
 t.Commit()
 
-print("✅ Completed with numbering + in-place comments applied.")
+print("✅ Completed: Fully adjacency-locked column sweep.")
